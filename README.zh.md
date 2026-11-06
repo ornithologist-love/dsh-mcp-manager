@@ -1,6 +1,8 @@
 # dsh-mcp-manager
 
-[English](README.md) | [中文](README.zh.md) · [![npm version](https://img.shields.io/npm/v/dsh-mcp-manager)](https://www.npmjs.com/package/dsh-mcp-manager) · [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[English](README.md) | [中文](README.zh.md) · [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+本仓库是 [Nichts0v0/dsh-mcp-manager](https://github.com/Nichts0v0/dsh-mcp-manager) 的源码 fork，基于 `335f797c30b9c3880d997c27343c609c8019f040`，面向 DSH **0.2.2-rc.1**，补充可选嵌入策略、受管连接访问和 OAuth 重连改进，保留上游署名与 MIT 许可证。
 
 在 DeepSeek Harness 的 **Web 设置页**里直接管理 **MCP 服务器**——运行时添加、编辑、启用/停用、重连、删除，带实时状态、自动重连和配置文件热同步。
 
@@ -10,7 +12,8 @@
 - **OAuth 2.0 / RFC 9728 认证支持** — 原生支持 MCP OAuth 2.1 规范与 PKCE，自动发现认证元数据、浏览器授权登录、令牌自动刷新与凭证管理。
 - **运行时连接** — 服务器即时连接/断开；工具以 `mcp__<serverName>__<tool>` 全局注册，所有会话的 agent 都能调用。
 - **实时状态** — 可达性探测让关闭的服务器显示 **离线** 而不是陈旧的"已连接"；卡住的连接 30 秒后判为超时。
-- **自动重连** — 初始连接失败按指数退避重试（3s → 60s）；点"刷新"立即重试一次。
+- **宿主可见诊断** — Debug 与发布版都通过 stderr 输出 `[MCP][INFO|WARN|ERROR]` 日志，串起重连点击、断开/建立连接、OAuth 刷新、授权浏览器与回调。正常进度为 INFO，需要授权、超时或重试为 WARN，操作失败为 ERROR；stderr 仅表示输出通道，不代表错误级别。详细诊断仅在显式点击重连后开启，本次操作完成或超时即停止；轮询不刷日志；错误只提取已知网络、HTTP、OAuth 代码，不输出任意响应正文、凭据或授权链接，宿主可直接在现有运行日志面板展示。
+- **手动重试** — 初始连接失败后等待用户重连；打开页面或刷新状态不会触发重连。
 - **启用/停用** — 一键停用立即断开并卸载工具；重新启用即自动重连。
 - **配置热同步** — `$DSH_HOME/mcp-servers.json` 被实时监听，外部修改约 1 秒内生效，无需重启。
 - **主题与多语言** — 自动跟随 DSH 浅色/深色主题（含外观插件对 `--dsw-alias-*` token 的覆盖）；UI 内置**简体中文 / English**。
@@ -23,19 +26,15 @@
 
 ### 如果你是人类
 
-**方式一：npm 安装（最简单）：**
-
-```sh
-dsh plugin --profile web add dsh-mcp-manager
-```
-
-**方式二：源码安装：**
+**安装此源码 fork：**
 
 1. 克隆并构建：
 
    ```sh
-   git clone https://github.com/Nichts0v0/dsh-mcp-manager.git
-   cd dsh-mcp-manager && npm install      # prepare 脚本会自动构建 lib/
+   git clone https://github.com/ornithologist-love/dsh-mcp-manager.git
+   cd dsh-mcp-manager
+   npm install --ignore-scripts
+   npm run build
    ```
 
 2. 让 loader 能从 profile 解析该包（二选一）：
@@ -67,8 +66,7 @@ dsh plugin --profile web add dsh-mcp-manager
 请按顺序执行，不要跳步：
 
 1. **通读本 README**（尤其是"功能简介"、"已知限制"和本节）。
-2. **安装包**（优先 npm）：在目标 profile 下运行 `dsh plugin --profile <profile> add dsh-mcp-manager`（或在 `$DSH_HOME/profiles/<profile>` 下 `npm install dsh-mcp-manager`，再用下面的源码方式处理文件布局）。
-   - **源码兜底**：克隆本仓库 → `cd dsh-mcp-manager` → `npm install --ignore-scripts && npm run build`（产出自包含的 `lib/index.js` + `lib/client.js`，运行时零依赖）→ 把目录链接到 `$DSH_HOME/profiles/<profile>/node_modules/dsh-mcp-manager`（Windows 用目录 junction，POSIX 用符号链接）。
+2. **构建此 fork**：克隆本仓库 → `cd dsh-mcp-manager` → `npm install --ignore-scripts` → `npm run build` → 把目录链接到 `$DSH_HOME/profiles/<profile>/node_modules/dsh-mcp-manager`（Windows 用目录 junction，POSIX 用符号链接）。DSH 安装需匹配固定 SDK 版本，并提供声明的运行时 peer 依赖。
 3. **挂载插件行**：在 `$DSH_HOME/profiles/<profile>/cordis.patch.yml` 追加：
 
    ```yaml
@@ -182,18 +180,16 @@ dsh plugin --profile web add dsh-mcp-manager
 ## 开发
 
 ```sh
-npm install      # 仅构建期依赖；prepare 自动构建
-npm run build    # esbuild：lib/index.js（host，全内联）+ lib/client.js（浏览器）
-npm run watch    # 监听 client bundle（配合 dsh-client-hmr）
+npm install --ignore-scripts
+npm run build    # lib/index.js（host）+ lib/client.js（浏览器，内含 CSS）
+npm run watch    # 同时监听两个 bundle
 ```
 
-**发布**：改 `package.json` 的 `version` 后运行 `npm publish`（`prepare` 脚本会在打包前自动构建 `lib/`；发布包含 `lib/`、两份 README 和 LICENSE）。
-
-运行时零依赖：host 半内联了 `@deepseek-ai/dsh-mcp-client`、MCP SDK 和 `cross-spawn`；浏览器半是 DSH 客户端模块系统托管的闭包工厂 bundle。
+构建只依赖本仓库和公开 npm 包。运行时 peer（`@deepseek-ai/cordis`、`@deepseek-ai/dsh-mcp-client`、`@modelcontextprotocol/sdk`）由嵌入环境提供；浏览器复用宿主 React 和 DSH 模块身份，CSS Modules 在浏览器工厂内编译注入。`prepack` 在打包前构建两个产物。
 
 ## 已知限制
 
-- **初始失败是退避重试而非即时** — `failOnStartupError` 开启，首次连接失败显示 `error` 并最多每 60 秒重试一次；连接成功后由 mcp-client 自带重连处理断线。
+- **初始失败等待用户操作** — `failOnStartupError` 开启，首次连接失败显示 `error`，不再后台重试；已成功连接后的断线恢复仍由 mcp-client 处理。
 - **可达性探测是 HTTP 层** — 对 `streamable-http` 服务器发 GET（2.5 秒超时，任何 HTTP 响应都算可达）；`stdio` 服务器不探测。
 - **仅桥接 tools** — MCP Resources/Prompts 未桥接（与官方 mcp-client 一致）。
 - **鉴权只有令牌、默认仅 loopback** — `/mcp-manager/*` 没有用户体系；对外暴露 `--host 0.0.0.0` 前请先配置 `token`（见"安全"一节；stdio 服务器可执行任意命令）。
@@ -202,3 +198,13 @@ npm run watch    # 监听 client bundle（配合 dsh-client-hmr）
 ## 许可证
 
 MIT
+
+## 嵌入此源码分支
+
+嵌入方可通过 `isAvailable(entry)` 按名称或地址屏蔽宿主保留的服务，在连接、管理、探测和 OAuth 之前拒绝接入。隐藏项仍完整保留在磁盘；新建和修改后的配置同样受此策略约束。不提供该回调时保持原独立行为。
+
+配置 `useIntegration: true` 后，管理器等待 `mcpManagerIntegration` 服务：提供连接输入转换、非回调请求鉴权、OAuth 客户端注册准备以及就绪后的连接启动。提供方卸载时释放管理器作用域。不启用时保持原独立运行的启动和鉴权规则。OAuth 回调继续校验待办 state；授权、交换令牌和刷新使用发现到的同一 resource，刷新使用服务器元数据，失败时报错而不沿用过期令牌。重连在点击时预留弹窗，并通过管理器查询授权后的连接状态；完成消息要求同源。
+
+嵌入方还可提供 `products: { active: "alpha", servers: { alpha: ["alpha-tools"], beta: ["beta-tools"] } }`。Manager 仅显示、连接、重试、探测和管理当前产品的服务，以及没有归入任何产品的自定义服务。省略 `active` 时隐藏所有产品预置项。隐藏项的直接管理与 OAuth 请求会被拒绝；保存其他服务时仍完整保留它们的配置、启停状态和凭据。已有全局配置无需迁移即可按当前产品生效。当前产品由嵌入方提供，不是用户可修改的服务器字段。
+
+同进程 `ctx.mcpManager` 服务为增强插件提供 `servers()`、`tools(serverName)` 和 `callTool(serverName, execution)`，不暴露凭据或传输句柄。`ensureConnected(serverName, {interactive, signal, onPhase})` 仅在显式用户点击（`interactive: true`）时允许启用和连接服务，并通过嵌入方的 `openAuthorizationUrl(URL)` 打开系统浏览器；复用 Manager 的 PKCE、回调与凭据存储，同一服务的并发请求共享授权。恢复会话不弹浏览器，取消某个等待者不关闭其他会话共用的连接。调用必须使用当前产品可见且已连接的服务，并经原生 ToolRuntime 保留调用者作用域、策略链和取消。嵌套调用传递父 token 与根调用 ID；原始 MCP 工具仍由 Manager 持有。

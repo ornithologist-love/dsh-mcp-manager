@@ -6,11 +6,11 @@
   "main": "lib/index.js",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Nichts0v0/dsh-mcp-manager.git"
+    "url": "git+https://github.com/ornithologist-love/dsh-mcp-manager.git"
   },
-  "homepage": "https://github.com/Nichts0v0/dsh-mcp-manager",
+  "homepage": "https://github.com/ornithologist-love/dsh-mcp-manager",
   "bugs": {
-    "url": "https://github.com/Nichts0v0/dsh-mcp-manager/issues"
+    "url": "https://github.com/ornithologist-love/dsh-mcp-manager/issues"
   },
   "exports": {
     ".": "./lib/index.js",
@@ -36,7 +36,7 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "watch": "node scripts/build.mjs --watch",
-    "prepare": "node scripts/build.mjs"
+    "prepack": "npm run build"
   },
   "keywords": [
     "dsh",
@@ -45,12 +45,24 @@
     "deepseek-harness"
   ],
   "devDependencies": {
-    "@deepseek-ai/dsh-mcp-client": "0.1.0-rc.6",
-    "@types/node": "^26.2.0",
-    "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.2.4",
-    "esbuild": "^0.25.0",
-    "typescript": "^7.0.2"
+    "@deepseek-ai/dsh-host-webserver": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.2.2-rc.1",
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-mcp-client": "0.2.2-rc.1",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@types/node": "24.0.0",
+    "@types/react": "18.3.1",
+    "@types/react-dom": "18.3.0",
+    "esbuild": "0.28.2",
+    "lightningcss": "1.32.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-mcp-client": "0.2.2-rc.1",
+    "@modelcontextprotocol/sdk": "1.32.1"
+  },
+  "dshFork": "mcp-integration-v1"
 }

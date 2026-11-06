@@ -18,6 +18,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, unwatchFile, watchFile, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { apply as mcpClientApply } from '@deepseek-ai/dsh-mcp-client'
 import {
   discoverOAuthServerInfo,
@@ -27,11 +28,70 @@ import {
 } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { Context, Fiber } from '@deepseek-ai/cordis'
 
+/** Optional embedding policy; the manager keeps ownership of routes and connections. */
+export interface McpManagerIntegration {
+  /** Hide and refuse host-reserved entries without changing their persisted configuration. */
+  isAvailable?(entry: McpServerEntry): boolean
+  /** Override activation for this process without changing the saved enable flag. */
+  isEnabled?(entry: McpServerEntry): boolean
+  /** Product-owned server names. Unlisted servers remain available to every product. */
+  products?: {
+    /** No active product hides all product-owned servers. */
+    active?: string
+    servers: Record<string, readonly string[]>
+  }
+  transformEntry(entry: McpServerEntry, headers?: Record<string, string>): { entry: McpServerEntry; headers?: Record<string, string> }
+  authorizeRequest(request: import('node:http').IncomingMessage): boolean
+  /**
+   * Register a client when none is usable. `configured` is true only for a
+   * user-entered client or a dynamically registered client whose recorded
+   * redirect URI equals this flow's; otherwise the integration must register a
+   * fresh client and report it with `registered: true`.
+   */
+  prepareOAuthClient(client: { client_id: string; client_secret?: string }, discovery: Awaited<ReturnType<typeof discoverOAuthServerInfo>>, redirectUri: string, configured: boolean): Promise<void | { registered: boolean }>
+  /** Open an SDK-generated authorization URL in the embedding product's system browser. */
+  openAuthorizationUrl?(url: URL): Promise<void>
+  onReady(start: () => void): () => void
+}
+
+/** Host composition options. */
+export interface Config {
+  /** Wait for an embedding policy before loading configuration or routes. */
+  useIntegration?: boolean
+}
+
 declare module '@deepseek-ai/cordis' {
   interface Context {
-    webServer: any
+    mcpManagerIntegration: McpManagerIntegration
+    /** Same-process access to managed servers; credentials and transports stay private. */
+    mcpManager: ManagedMcpServers
   }
 }
+
+/** Extend an existing managed connection without opening another transport or OAuth flow. */
+export interface ManagedMcpServers {
+  servers(): Array<{ serverName: string; status: string; toolCount: number }>
+  /** Reconnect and refresh existing authorization without enabling a disabled server or opening OAuth. */
+  reconnect(serverName: string, options: { signal: AbortSignal }): Promise<void>
+  /** Explicit clicks may enable/connect and authorize; restoration never opens a browser. */
+  ensureConnected(serverName: string, options: { interactive: boolean; signal: AbortSignal; onPhase?: (phase: string) => void }): Promise<void>
+  tools(serverName: string): ReturnType<Context['tools']['schemas']>
+  /** Run one managed tool call with already-parsed arguments in the caller's scope. */
+  callTool(serverName: string, execution: ManagedToolCall): Promise<unknown>
+}
+
+type ToolBatch = Parameters<Context['tools']['execute']>[0]
+
+/** One managed tool call; the batch executor owns parsing, dispatch and cancellation. */
+export interface ManagedToolCall {
+  callId: ToolBatch['calls'][number]['id']
+  name: string
+  arguments: unknown
+  signal: AbortSignal
+  agent?: ToolBatch['agent']
+}
+
+import type {} from '@deepseek-ai/dsh-host-webserver'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'mcp-manager'
@@ -52,6 +112,14 @@ export interface OAuthTokens {
 export interface McpServerOAuthConfig {
   clientId?: string
   clientSecret?: string
+  /**
+   * Set when `clientId` came from dynamic client registration. Authorization
+   * servers bind such clients to their registered redirect URI, so a client
+   * registered for another port, host or product cannot be reused.
+   */
+  registeredRedirectUri?: string
+  /** `clientId` was entered by the user; never replaced by registration. */
+  userProvided?: boolean
   scopes?: string[]
   authorizationServerUrl?: string
   tokens?: OAuthTokens
@@ -87,6 +155,31 @@ export interface McpServerEntry {
   oauth?: McpServerOAuthConfig
 }
 
+/**
+ * Settings saves carry the whole OAuth object back. Registration metadata and
+ * tokens are manager-owned: keep them only while the client ID is unchanged;
+ * a newly typed client ID is user-provided and starts without tokens.
+ */
+function reconcileOAuthClient(previous: McpServerOAuthConfig | undefined, incoming: McpServerOAuthConfig): McpServerOAuthConfig {
+  const { registeredRedirectUri: _redirect, userProvided: _user, tokens: _tokens, clientSecret: _secret, ...fields } = incoming
+  if (!fields.clientId) {
+    // Clearing the field asks for automatic registration on the next sign-in;
+    // the current tokens keep working until then.
+    const { clientId: _id, ...rest } = fields
+    return { ...rest, ...(previous?.tokens ? { tokens: previous.tokens } : {}) }
+  }
+  if (previous?.clientId === fields.clientId) {
+    return {
+      ...fields,
+      ...(previous.clientSecret ? { clientSecret: previous.clientSecret } : {}),
+      ...(previous.registeredRedirectUri ? { registeredRedirectUri: previous.registeredRedirectUri } : {}),
+      ...(previous.userProvided ? { userProvided: true } : {}),
+      ...(previous.tokens ? { tokens: previous.tokens } : {}),
+    }
+  }
+  return { ...fields, ...(incoming.clientSecret ? { clientSecret: incoming.clientSecret } : {}), userProvided: true }
+}
+
 /** The persisted file shape. */
 export interface StoredState {
   version: 1
@@ -117,12 +210,6 @@ const PROBE_TTL_MS = 5_000
 const PROBE_TIMEOUT_MS = 2_500
 /** A server stuck in "connecting" for longer than this is reported as a timeout. */
 const CONNECT_TIMEOUT_MS = 30_000
-/** Initial retry delay for a failed connect; doubles up to RETRY_MAX_MS. */
-const RETRY_BASE_MS = 3_000
-/** Ceiling for the automatic reconnect backoff of failed initial connects. */
-const RETRY_MAX_MS = 60_000
-/** Minimum gap between manual/refresh-triggered retries of a failed server. */
-const RETRY_THROTTLE_MS = 3_000
 /** Config-file watcher poll interval (fs.watchFile polls; robust across platforms). */
 const FILE_WATCH_INTERVAL_MS = 1_000
 /** Debounce for externally triggered config reloads. */
@@ -161,7 +248,8 @@ function saveState(path: string, state: StoredState): void {
 }
 
 /** Project the manager entry onto the mcp-client Config shape. */
-function toMcpConfig(entry: McpServerEntry, resolvedHeaders?: Record<string, string>): unknown {
+function toMcpConfig(entry: McpServerEntry, resolvedHeaders?: Record<string, string>, integration?: McpManagerIntegration): unknown {
+  if (integration) ({ entry, headers: resolvedHeaders } = integration.transformEntry(entry, resolvedHeaders))
   const base = {
     serverName: entry.serverName,
     transport: entry.transport,
@@ -191,9 +279,67 @@ function escapeHtml(str: string): string {
  * The manager plugin. One instance per process; it owns the server list, the
  * live connection map, and the `/mcp-manager/api/*` routes.
  */
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config: Config = {}): void {
+  if (config.useIntegration) {
+    ctx.inject(['mcpManagerIntegration'], scope => applyManager(scope, scope.mcpManagerIntegration))
+  } else {
+    applyManager(ctx)
+  }
+}
+
+function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
   const path = storePath()
   const state = loadState(path)
+  const products = integration?.products
+  const productServers = new Set(Object.values(products?.servers ?? {}).flat())
+  const activeServers = new Set(products?.active === undefined ? [] : products.servers[products.active] ?? [])
+  const available = (serverName: string, entry = state.servers.find(server => server.serverName === serverName)): boolean =>
+    (!productServers.has(serverName) || activeServers.has(serverName)) && (!entry || integration?.isAvailable?.(entry) !== false)
+  // Keep the complete file in memory so saving one product never removes another's entries.
+  const visibleEntries = (): McpServerEntry[] => state.servers.filter(entry => available(entry.serverName, entry))
+  const isEnabled = (entry: McpServerEntry): boolean => integration?.isEnabled?.(entry) ?? entry.enabled !== false
+
+  // Cordis log records are not necessarily forwarded to an embedding host.
+  // stderr is the host-visible diagnostic channel in both Debug and Release.
+  // Severity belongs to the record, independently of its output stream.
+  type DiagnosticLevel = 'INFO' | 'WARN' | 'ERROR'
+  const manualDiagnosticsUntil = new Map<string, number>()
+  function diagnostic(serverName: string, phase: string, detail = '', level: DiagnosticLevel = 'INFO'): void {
+    if (phase === 'reconnect-requested' || phase === 'ui-click') manualDiagnosticsUntil.set(serverName, Date.now() + 180_000)
+    if ((manualDiagnosticsUntil.get(serverName) ?? 0) <= Date.now()) {
+      manualDiagnosticsUntil.delete(serverName)
+      return
+    }
+    const entry = state.servers.find(server => server.serverName === serverName)
+    const secrets = [state.token, entry?.oauth?.clientSecret, entry?.oauth?.tokens?.accessToken,
+      entry?.oauth?.tokens?.refreshToken, ...Object.values(entry?.headers ?? {}), ...Object.values(entry?.env ?? {})]
+      .filter((value): value is string => typeof value === 'string' && value.length > 0)
+      .sort((a, b) => b.length - a.length)
+    for (const secret of secrets) detail = detail.split(secret).join('[redacted]')
+    detail = detail.replace(/https?:\/\/[^\s"'<>]+/gi, '[url]')
+      .replace(/Bearer\s+\S+|\b(?:sk|ck|ds)-[A-Za-z0-9_-]+/gi, '[redacted]')
+      .replace(/(["']?(?:[\w-]*(?:token|secret|password|authorization|cookie)|api[_-]?key|code|state)["']?\s*[:=]\s*)("[^"]*"|'[^']*'|[^\s,;}]+)/gi, '$1[redacted]')
+      .replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 600)
+    const safeName = SERVER_NAME_PATTERN.test(serverName) ? serverName : 'unknown'
+    process.stderr.write(`[MCP][${level}] server=${safeName} phase=${phase}${detail ? ` ${detail}` : ''}\n`)
+    if (phase === 'ui-connected' || phase === 'ui-failed' || phase === 'ui-cancelled') manualDiagnosticsUntil.delete(serverName)
+  }
+
+  // SDK errors can contain response bodies, headers or authorization URLs.
+  // Extract known failure codes; never forward their arbitrary message/body.
+  function diagnosticError(error: unknown): string {
+    const cause = (error as { cause?: unknown } | null)?.cause
+    const text = `${String(error)} ${String(cause ?? '')}`
+    const type = error instanceof TypeError ? 'TypeError' : error instanceof Error ? 'Error' : 'UnknownError'
+    const code = text.match(/\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EPIPE|CERT_HAS_EXPIRED|DEPTH_ZERO_SELF_SIGNED_CERT|UNABLE_TO_VERIFY_LEAF_SIGNATURE|UND_ERR_CONNECT_TIMEOUT)\b/)?.[0]
+    const oauth = text.match(/\b(?:invalid_grant|invalid_token|invalid_client|unauthorized_client|access_denied|invalid_scope|server_error|temporarily_unavailable)\b/i)?.[0].toLowerCase()
+    const status = text.match(/(?:\bHTTP|\bstatus(?:\s+code)?|\bSSE error)[^\d\r\n]{0,32}([45]\d\d)\b/i)?.[1]
+    const reason = /timeout|timed out|超时/i.test(text) ? 'timeout'
+      : /client\s*id|client_id/i.test(text) ? 'oauth-client'
+      : /OAuth|unauthorized|授权|\b401\b/i.test(text) ? 'authorization'
+      : /fetch failed|network|socket|connect/i.test(text) ? 'transport' : 'operation'
+    return `errorType=${type} reason=${reason}${code ? ` code=${code}` : ''}${status ? ` httpStatus=${status}` : ''}${oauth ? ` oauthError=${oauth}` : ''}`
+  }
 
   /** Whether the web server is reachable beyond loopback (needs an access token). */
   const exposed = ctx.webServer.host !== '127.0.0.1'
@@ -235,10 +381,7 @@ export function apply(ctx: Context): void {
   const connectingSince = new Map<string, number>()
   /** serverName → serialized operation chain (prevents connect/disconnect races). */
   const queues = new Map<string, Promise<void>>()
-  /** serverName → pending auto-retry timer for a failed initial connect. */
-  const retryTimers = new Map<string, ReturnType<typeof setTimeout>>()
-  /** serverName → last connect attempt timestamp (throttles refresh-triggered retries). */
-  const lastAttempt = new Map<string, number>()
+  const reportedTimeouts = new Set<string>()
 
   /** Pending OAuth authorization sessions keyed by state. */
   interface PendingOAuthSession {
@@ -247,12 +390,84 @@ export function apply(ctx: Context): void {
     url: string
     codeVerifier: string
     redirectUri: string
+    resource: string
     authorizationServerUrl: string
     metadata?: any
     clientInformation: { client_id: string; client_secret?: string }
+    /** Redirect URI the client was dynamically registered with, if any. */
+    registeredRedirectUri?: string
+    /** The client ID was entered by the user rather than registered. */
+    userProvided?: boolean
     createdAt: number
   }
   const pendingOAuthSessions = new Map<string, PendingOAuthSession>()
+  // The system browser has no WebView opener. Keep a short-lived result for
+  // the initiating settings page to observe without exposing any credentials.
+  const oauthResults = new Map<string, {
+    serverName: string; status: 'pending' | 'authorized' | 'error'; error?: string; createdAt: number
+  }>()
+  const authorizationJobs = new Map<string, Promise<void>>()
+  const lifetime = new AbortController()
+
+  // Both the settings page and an explicit capability click use this same
+  // PKCE flow, callback, token store and managed connection.
+  async function beginOAuth(body: {
+    serverName: string; url?: string; clientId?: string; clientSecret?: string; scopes?: string[]; redirectUri?: string
+  }, defaultRedirectUri: string) {
+    diagnostic(body.serverName, 'oauth-start')
+    const entry = findEntry(body.serverName)
+    const targetUrl = body.url || entry?.url
+    if (!targetUrl || !available(body.serverName, { ...entry, serverName: body.serverName, transport: 'streamable-http', url: targetUrl }))
+      throw new Error('MCP server is unavailable for authorization.')
+    const serverInfo = await discoverOAuthServerInfo(targetUrl).catch(() => ({
+      authorizationServerUrl: targetUrl, authorizationServerMetadata: undefined, resourceMetadata: undefined,
+    }))
+    const authServerUrl = serverInfo.authorizationServerUrl || targetUrl
+    const redirectUri = body.redirectUri || defaultRedirectUri
+    const saved = entry?.oauth
+    // A client ID typed into the form (different from the saved one) is the
+    // user's choice. A saved client is reused only when it cannot have been
+    // bound to another redirect URI: the user entered it, it was dynamically
+    // registered for exactly this URI, or the server offers no registration
+    // (so a pre-registered client is the only option). Any other saved client —
+    // registered for another sidecar port or host, or migrated from another
+    // product without a record — is rejected by the authorization server
+    // before sign-in, so a fresh client is registered instead.
+    const userClient = body.clientId && body.clientId !== saved?.clientId ? body.clientId : undefined
+    const canRegister = Boolean(serverInfo.authorizationServerMetadata?.registration_endpoint)
+    const keepSaved = !userClient && Boolean(saved?.clientId) && (
+      saved?.userProvided === true
+      || saved?.registeredRedirectUri === redirectUri
+      || (saved?.registeredRedirectUri === undefined && !canRegister))
+    const clientInformation = {
+      client_id: userClient || (keepSaved ? saved!.clientId! : 'dsh-mcp-manager'),
+      client_secret: userClient ? body.clientSecret : (keepSaved ? saved?.clientSecret : undefined),
+    }
+    const prepared = await integration?.prepareOAuthClient(clientInformation, serverInfo, redirectUri, Boolean(userClient || keepSaved))
+    diagnostic(body.serverName, 'oauth-client-ready', `registration=${prepared && prepared.registered ? 'new' : 'reused'}`)
+    const registration: Pick<PendingOAuthSession, 'registeredRedirectUri' | 'userProvided'> = userClient
+      ? { userProvided: true }
+      : prepared && prepared.registered
+        ? { registeredRedirectUri: redirectUri }
+        : keepSaved
+          ? { registeredRedirectUri: saved?.registeredRedirectUri, userProvided: saved?.userProvided }
+          : {}
+    if (saved?.clientId && !keepSaved && !userClient)
+      ctx.logger.info(`mcp-manager: "${body.serverName}" OAuth client ${saved.clientId} is not registered for ${redirectUri}; registered ${clientInformation.client_id}`)
+    const resource = serverInfo.resourceMetadata?.resource || targetUrl
+    const stateVal = randomBytes(16).toString('hex')
+    const { authorizationUrl, codeVerifier } = await startAuthorization(authServerUrl, {
+      metadata: serverInfo.authorizationServerMetadata, clientInformation, redirectUrl: redirectUri,
+      scope: body.scopes?.join(' ') || entry?.oauth?.scopes?.join(' '), state: stateVal, resource: new URL(resource),
+    })
+    pendingOAuthSessions.set(stateVal, {
+      state: stateVal, serverName: body.serverName, url: targetUrl, codeVerifier, redirectUri, resource,
+      authorizationServerUrl: authServerUrl, metadata: serverInfo.authorizationServerMetadata,
+      clientInformation, ...registration, createdAt: Date.now(),
+    })
+    oauthResults.set(stateVal, { serverName: body.serverName, status: 'pending', createdAt: Date.now() })
+    return { ok: true, authorizationUrl: authorizationUrl.toString(), state: stateVal, redirectUri }
+  }
 
   /** Resolve dynamic headers for an entry (e.g. injecting or refreshing OAuth access tokens). */
   async function resolveEntryHeaders(entry: McpServerEntry, onSave?: () => void): Promise<Record<string, string>> {
@@ -261,25 +476,33 @@ export function apply(ctx: Context): void {
       const tokens = entry.oauth.tokens
       // Refresh token automatically if expiring within 60 seconds
       if (tokens.refreshToken && tokens.expiresAt && Date.now() > tokens.expiresAt - 60_000) {
+        const started = Date.now()
+        diagnostic(entry.serverName, 'oauth-refresh-start')
         try {
           const authServerUrl = entry.oauth.authorizationServerUrl || entry.url || ''
           if (authServerUrl) {
+            const discovered = await discoverOAuthServerInfo(entry.url || authServerUrl)
             const refreshed = await refreshAuthorization(authServerUrl, {
+              metadata: discovered.authorizationServerMetadata,
               clientInformation: {
                 client_id: entry.oauth.clientId || 'dsh-mcp-manager',
                 client_secret: entry.oauth.clientSecret,
               },
               refreshToken: tokens.refreshToken,
+              resource: entry.url ? new URL(discovered.resourceMetadata?.resource || entry.url) : undefined,
             })
             if (refreshed.access_token) {
               tokens.accessToken = refreshed.access_token
               if (refreshed.refresh_token) tokens.refreshToken = refreshed.refresh_token
               if (refreshed.expires_in) tokens.expiresAt = Date.now() + refreshed.expires_in * 1000
               if (onSave) onSave()
+              diagnostic(entry.serverName, 'oauth-refresh-complete', `elapsedMs=${Date.now() - started}`)
             }
           }
         } catch (err) {
+          diagnostic(entry.serverName, 'oauth-refresh-failed', `elapsedMs=${Date.now() - started} ${diagnosticError(err)}`, 'ERROR')
           ctx.logger.warn(`mcp-manager: token refresh failed for "${entry.serverName}": ${String(err)}`)
+          throw new Error(`服务器「${entry.serverName}」的 OAuth 授权刷新失败，请重新授权后连接。`)
         }
       }
       headers['Authorization'] = `Bearer ${tokens.accessToken}`
@@ -295,46 +518,30 @@ export function apply(ctx: Context): void {
     return next
   }
 
-  function clearRetry(serverName: string): void {
-    const timer = retryTimers.get(serverName)
-    if (timer !== undefined) {
-      clearTimeout(timer)
-      retryTimers.delete(serverName)
-    }
-  }
-
-  /** Exponential backoff retry so a server that was down at startup connects once it comes up. */
-  function scheduleRetry(entry: McpServerEntry, attempt: number): void {
-    if (entry.enabled === false) return
-    clearRetry(entry.serverName)
-    const delay = Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_MS)
-    ctx.logger.info(`mcp-manager: server "${entry.serverName}" will retry in ${Math.round(delay / 1000)}s (attempt ${attempt})`)
-    retryTimers.set(entry.serverName, setTimeout(() => {
-      retryTimers.delete(entry.serverName)
-      void connect(entry, attempt + 1).catch(() => { /* failures are recorded by connectNow */ })
-    }, delay))
-  }
-
   async function connectNow(entry: McpServerEntry, attempt = 1): Promise<void> {
-    if (entry.enabled === false) return
+    if (!isEnabled(entry) || !available(entry.serverName, entry)) return
     if (fibers.has(entry.serverName)) return
-    clearRetry(entry.serverName)
-    lastAttempt.set(entry.serverName, Date.now())
     errors.delete(entry.serverName)
     connectingSince.set(entry.serverName, Date.now())
+    reportedTimeouts.delete(entry.serverName)
+    const started = Date.now()
+    diagnostic(entry.serverName, 'connect-start', `transport=${entry.transport} attempt=${attempt}`)
 
     // If OAuth is configured but no access token is available, mark as error/awaiting auth
     if (entry.authType === 'oauth' && !entry.oauth?.tokens?.accessToken) {
       errors.set(entry.serverName, '需要 OAuth 授权登录：请在配置中完成授权')
       connectingSince.delete(entry.serverName)
+      diagnostic(entry.serverName, 'connect-auth-required', '', 'WARN')
       return
     }
 
-    const resolvedHeaders = await resolveEntryHeaders(entry, () => saveState(path, state))
-    const fiber = ctx.plugin(mcpClientApply, toMcpConfig(entry, resolvedHeaders) as any)
-    fibers.set(entry.serverName, fiber)
     try {
+      const resolvedHeaders = await resolveEntryHeaders(entry, () => saveState(path, state))
+      const fiber = ctx.plugin(mcpClientApply, toMcpConfig(entry, resolvedHeaders, integration) as any)
+      fibers.set(entry.serverName, fiber)
       await fiber
+      const status = statusOf(entry)
+      diagnostic(entry.serverName, 'connect-complete', `status=${status.status} tools=${status.toolCount} elapsedMs=${Date.now() - started}`, status.status === 'error' ? 'ERROR' : 'INFO')
     } catch (err) {
       fibers.delete(entry.serverName)
       const cause = (err as { cause?: unknown } | null)?.cause
@@ -342,28 +549,34 @@ export function apply(ctx: Context): void {
       const detail = cause !== undefined && cause !== null ? `${message}（原因: ${String(cause)}）` : message
       errors.set(entry.serverName, detail)
       connectingSince.delete(entry.serverName)
+      diagnostic(entry.serverName, 'connect-failed', `elapsedMs=${Date.now() - started} ${diagnosticError(err)}`, 'ERROR')
       ctx.logger.error(`mcp-manager: server "${entry.serverName}" failed to start: ${detail}`)
-      scheduleRetry(entry, attempt + 1)
     }
   }
 
   async function disconnectNow(serverName: string): Promise<void> {
-    clearRetry(serverName)
+    const started = Date.now()
+    diagnostic(serverName, 'disconnect-start')
     const fiber = fibers.get(serverName)
-    if (!fiber) return
+    if (!fiber) { diagnostic(serverName, 'disconnect-complete', 'connection=absent'); return }
     fibers.delete(serverName)
     errors.delete(serverName)
     probeCache.delete(serverName)
     connectingSince.delete(serverName)
+    const stalled = setTimeout(() => diagnostic(serverName, 'disconnect-pending', `elapsedMs=${Date.now() - started}`, 'WARN'), CONNECT_TIMEOUT_MS)
+    stalled.unref()
     try {
       await fiber.dispose()
+      diagnostic(serverName, 'disconnect-complete', `elapsedMs=${Date.now() - started}`)
     } catch (err) {
+      diagnostic(serverName, 'disconnect-failed', `elapsedMs=${Date.now() - started} ${diagnosticError(err)}`, 'ERROR')
       ctx.logger.warn(`mcp-manager: disposing server "${serverName}" reported: ${String(err)}`)
-    }
+    } finally { clearTimeout(stalled) }
   }
 
   /** Enqueued connect: serialized with other mutations of the same server. */
   function connect(entry: McpServerEntry, attempt = 1): Promise<void> {
+    if (!available(entry.serverName, entry)) return Promise.resolve()
     return enqueue(entry.serverName, () => connectNow(entry, attempt))
   }
 
@@ -374,25 +587,142 @@ export function apply(ctx: Context): void {
 
   /** Live status of one server: connected / connecting / error / disabled / disconnected. */
   function statusOf(entry: McpServerEntry): { status: string; toolCount: number; error?: string } {
-    if (entry.enabled === false) return { status: 'disabled', toolCount: 0 }
+    if (!isEnabled(entry)) return { status: 'disabled', toolCount: 0 }
     const error = errors.get(entry.serverName)
     if (error !== undefined) {
       connectingSince.delete(entry.serverName)
       return { status: 'error', toolCount: 0, error }
     }
-    if (!fibers.has(entry.serverName)) return { status: 'disconnected', toolCount: 0 }
+    const mounted = fibers.has(entry.serverName)
+    const since = connectingSince.get(entry.serverName)
+    if (!mounted && since === undefined) return { status: 'disconnected', toolCount: 0 }
     const prefix = `mcp__${entry.serverName}__`
-    const toolCount = ctx.tools.schemas().filter(schema => schema.name.startsWith(prefix)).length
+    const toolCount = mounted ? ctx.tools.schemas().filter(schema => schema.name.startsWith(prefix)).length : 0
     if (toolCount > 0) {
       connectingSince.delete(entry.serverName)
       return { status: 'connected', toolCount }
     }
-    const since = connectingSince.get(entry.serverName)
     if (since !== undefined && Date.now() - since > CONNECT_TIMEOUT_MS) {
+      if (!reportedTimeouts.has(entry.serverName)) {
+        reportedTimeouts.add(entry.serverName)
+        diagnostic(entry.serverName, 'connect-timeout', `elapsedMs=${Date.now() - since}`, 'WARN')
+      }
       return { status: 'error', toolCount: 0, error: `连接超时（超过 ${Math.round(CONNECT_TIMEOUT_MS / 1000)} 秒未建立连接）` }
     }
     return { status: 'connecting', toolCount }
   }
+
+  // Consumers borrow the existing ToolRuntime bridge. Credentials and transports
+  // remain private; only explicit user interaction may request authorization.
+  const requireConnected = (serverName: string): void => {
+    const entry = visibleEntries().find(candidate => candidate.serverName === serverName)
+    if (!entry || statusOf(entry).status !== 'connected') {
+      throw new Error(`MCP server "${serverName}" is unavailable; enable and authorize it in MCP settings.`)
+    }
+  }
+  ctx.provide('mcpManager', {
+    servers: () => visibleEntries().map(entry => {
+      const { status, toolCount } = statusOf(entry)
+      return { serverName: entry.serverName, status, toolCount }
+    }),
+    async reconnect(serverName, { signal }) {
+      signal.throwIfAborted()
+      const entry = visibleEntries().find(candidate => candidate.serverName === serverName)
+      if (!entry) throw new Error('The managed MCP server is unavailable in this product.')
+      if (!isEnabled(entry)) { requireConnected(serverName); return }
+      const connection = enqueue(serverName, async () => {
+        await disconnectNow(serverName)
+        await connectNow(entry)
+      })
+      const waiting = new AbortController()
+      try {
+        await Promise.race([
+          connection,
+          delay(CONNECT_TIMEOUT_MS, undefined, { signal: AbortSignal.any([signal, waiting.signal]) }).then(() => {
+            throw new Error('MCP connection timed out; retry in MCP settings.')
+          }),
+        ])
+      } finally { waiting.abort() }
+      while (statusOf(entry).status === 'connecting')
+        await delay(250, undefined, { signal })
+      if (statusOf(entry).status !== 'connected')
+        throw new Error(statusOf(entry).error || 'MCP connection failed; retry in MCP settings.')
+    },
+    async ensureConnected(serverName, { interactive, signal, onPhase }) {
+      signal.throwIfAborted()
+      const entry = visibleEntries().find(candidate => candidate.serverName === serverName)
+      if (!entry) throw new Error('The managed MCP server is unavailable in this product.')
+      if (statusOf(entry).status === 'connected') return
+      if (!interactive) { requireConnected(serverName); return }
+      let job = authorizationJobs.get(serverName)
+      if (job) onPhase?.('authorizing')
+      else {
+        job = (async () => {
+          const waitSignal = AbortSignal.any([lifetime.signal, AbortSignal.timeout(180000)])
+          if (!isEnabled(entry)) { entry.enabled = true; saveState(path, state) }
+          let failure: unknown
+          try { await connect(entry) } catch (error) { failure = error }
+          const connectionDeadline = Date.now() + CONNECT_TIMEOUT_MS
+          while (statusOf(entry).status === 'connecting' && Date.now() < connectionDeadline && !failure)
+            await delay(250, undefined, { signal: waitSignal })
+          if (statusOf(entry).status === 'connected') return
+          const message = failure instanceof Error ? failure.message : statusOf(entry).error ?? ''
+          if (entry.authType !== 'oauth' || (entry.oauth?.tokens?.accessToken && !/OAuth|\b401\b|unauthorized|invalid[_ ]token|invalid_grant/i.test(message)))
+            throw new Error(message || 'The managed MCP server could not connect.')
+          if (!integration?.openAuthorizationUrl) throw new Error('Complete OAuth authorization in MCP settings.')
+          const authorization = await beginOAuth({ serverName }, `http://127.0.0.1:${ctx.webServer.port}/mcp-manager/api/oauth/callback`)
+          try {
+            waitSignal.throwIfAborted()
+            if (!visibleEntries().some(candidate => candidate.serverName === serverName && isEnabled(candidate))) throw new Error('The managed MCP server is unavailable.')
+            onPhase?.('authorizing')
+            await integration.openAuthorizationUrl(new URL(authorization.authorizationUrl))
+            while (statusOf(entry).status !== 'connected') {
+              await delay(500, undefined, { signal: waitSignal })
+              if (!visibleEntries().some(candidate => candidate.serverName === serverName && isEnabled(candidate))) throw new Error('The managed MCP server is unavailable.')
+              const result = oauthResults.get(authorization.state)
+              if (result?.status === 'error' || (result?.status === 'authorized' && statusOf(entry).status === 'error'))
+                throw new Error('OAuth authorization or connection failed; retry in MCP settings.')
+            }
+          } finally { pendingOAuthSessions.delete(authorization.state) }
+        })().finally(() => { authorizationJobs.delete(serverName) })
+        authorizationJobs.set(serverName, job)
+      }
+      // Cancelling a capability removes only its waiter; another session may
+      // still be using the manager-owned authorization/connection.
+      let abort: () => void
+      try {
+        await Promise.race([job, new Promise<never>((_, reject) => {
+          abort = () => reject(signal.reason)
+          signal.addEventListener('abort', abort, { once: true })
+          if (signal.aborted) abort()
+        })])
+      } finally { signal.removeEventListener('abort', abort!) }
+    },
+    tools(serverName) {
+      requireConnected(serverName)
+      return ctx.tools.schemas().filter(tool => tool.name.startsWith(`mcp__${serverName}__`))
+    },
+    async callTool(serverName, execution) {
+      requireConnected(serverName)
+      if (!execution.name.startsWith(`mcp__${serverName}__`)
+        || ctx.tools.get(execution.name) === undefined
+        || ctx.tools.get(execution.name) !== ctx.tools.get(execution.name, execution.agent)) {
+        throw new Error('The managed MCP tool is not available in this execution scope.')
+      }
+      const { callId, name, signal, agent } = execution
+      const batch = await ctx.tools.execute({
+        calls: [{ type: 'tool-call', id: callId, name, arguments: JSON.stringify(execution.arguments ?? {}) }],
+        signal,
+        ...(agent === undefined ? {} : { agent }),
+      })
+      const result = batch.results[0]?.result
+      if (result === undefined) throw new Error('Managed MCP tool produced no result.')
+      if (result.isError) {
+        throw new Error(result.content.filter(block => block.type === 'text').map(block => block.text).join('\n') || 'Managed MCP tool failed.')
+      }
+      return result.value
+    },
+  })
 
   /**
    * Cheap reachability check for streamable-http servers: a GET that gets any
@@ -445,7 +775,7 @@ export function apply(ctx: Context): void {
   }
 
   function findEntry(serverName: string): McpServerEntry | undefined {
-    return state.servers.find(server => server.serverName === serverName)
+    return state.servers.find(server => server.serverName === serverName && available(serverName))
   }
 
   /**
@@ -472,7 +802,7 @@ export function apply(ctx: Context): void {
     for (const diskEntry of disk.servers) {
       const currentSig = currentSigs.get(diskEntry.serverName)
       if (currentSig === undefined || currentSig !== diskSigs.get(diskEntry.serverName)) {
-        if (diskEntry.enabled !== false) {
+        if (isEnabled(diskEntry)) {
           void connect(diskEntry).catch(err => {
             ctx.logger.error(`mcp-manager: reload connect "${diskEntry.serverName}" failed: ${String(err)}`)
           })
@@ -507,7 +837,8 @@ export function apply(ctx: Context): void {
     if (typeof entry.serverName !== 'string' || !SERVER_NAME_PATTERN.test(entry.serverName)) {
       throw new Error('serverName must match [A-Za-z0-9_-]{1,32}')
     }
-    if (findEntry(entry.serverName)) {
+    if (!available(entry.serverName, entry)) throw new Error(`server "${entry.serverName}" is not available in this product`)
+    if (state.servers.some(server => server.serverName === entry.serverName)) {
       throw new Error(`server "${entry.serverName}" already exists`)
     }
     validateFields(entry)
@@ -526,6 +857,7 @@ export function apply(ctx: Context): void {
     }
     entry.serverName = serverName
     validateFields(entry)
+    if (!available(serverName, { ...findEntry(serverName), ...entry })) throw new Error(`server "${serverName}" is not available in this product`)
     return entry
   }
 
@@ -556,6 +888,7 @@ export function apply(ctx: Context): void {
     })
 
   const handler = async (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse): Promise<void> => {
+    let diagnosticServer = 'unknown'
     try {
       const url = new URL(req.url ?? '/', 'http://localhost')
       const parts = url.pathname.split('/').filter(Boolean) // mcp-manager / api / ...
@@ -565,6 +898,7 @@ export function apply(ctx: Context): void {
       }
 
       const [action, serverName, sub] = parts.slice(2)
+      if (action === 'servers' && serverName) diagnosticServer = serverName
 
       // OAuth callback is loaded directly by user browser redirect, bypass standard token check
       if (req.method === 'GET' && action === 'oauth' && serverName === 'callback') {
@@ -578,6 +912,13 @@ export function apply(ctx: Context): void {
 
         if (errorParam || !code || !stateVal) {
           const errMsg = errorDescription || errorParam || 'Missing code or state parameter'
+          const result = stateVal ? oauthResults.get(stateVal) : undefined
+          if (result && stateVal) {
+            diagnostic(result.serverName, 'oauth-callback-failed', diagnosticError(errMsg), 'ERROR')
+            result.status = 'error'
+            result.error = errMsg
+            pendingOAuthSessions.delete(stateVal)
+          }
           res.end(`<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>OAuth Authorization Failed</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#18181b;color:#f4f4f5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.card{background:#27272a;padding:32px;border-radius:12px;max-width:480px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,0.5)}.err{color:#ef4444;margin-top:12px}</style></head>
@@ -599,7 +940,7 @@ export function apply(ctx: Context): void {
         }
 
         const session = pendingOAuthSessions.get(stateVal)
-        if (!session) {
+        if (!session || !available(session.serverName, { serverName: session.serverName, transport: 'streamable-http', url: session.url })) {
           res.end(`<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>OAuth Session Expired</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#18181b;color:#f4f4f5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.card{background:#27272a;padding:32px;border-radius:12px;max-width:480px;text-align:center}</style></head>
@@ -615,6 +956,7 @@ export function apply(ctx: Context): void {
         }
 
         pendingOAuthSessions.delete(stateVal)
+        diagnostic(session.serverName, 'oauth-callback-received')
 
         try {
           const tokens = await exchangeAuthorization(session.authorizationServerUrl, {
@@ -623,6 +965,7 @@ export function apply(ctx: Context): void {
             authorizationCode: code,
             codeVerifier: session.codeVerifier,
             redirectUri: session.redirectUri,
+            resource: new URL(session.resource),
           })
 
           let entry = findEntry(session.serverName)
@@ -637,10 +980,15 @@ export function apply(ctx: Context): void {
             state.servers.push(entry)
           }
           entry.authType = 'oauth'
+          // Replace the client identity as a unit so a stale secret or
+          // registration record never outlives the client it belonged to.
+          const { registeredRedirectUri: _redirect, clientSecret: _secret, userProvided: _user, ...savedOAuth } = entry.oauth ?? {}
           entry.oauth = {
-            ...(entry.oauth ?? {}),
+            ...savedOAuth,
             clientId: session.clientInformation.client_id,
-            clientSecret: session.clientInformation.client_secret,
+            ...(session.clientInformation.client_secret ? { clientSecret: session.clientInformation.client_secret } : {}),
+            ...(session.registeredRedirectUri ? { registeredRedirectUri: session.registeredRedirectUri } : {}),
+            ...(session.userProvided ? { userProvided: true } : {}),
             authorizationServerUrl: session.authorizationServerUrl,
             tokens: {
               accessToken: tokens.access_token,
@@ -651,6 +999,9 @@ export function apply(ctx: Context): void {
             },
           }
           saveState(path, state)
+          const result = oauthResults.get(stateVal)
+          if (result) result.status = 'authorized'
+          diagnostic(session.serverName, 'oauth-authorized')
 
           // Reconnect server immediately with the newly acquired token
           void enqueue(entry.serverName, async () => {
@@ -677,6 +1028,9 @@ export function apply(ctx: Context): void {
 </html>`)
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err)
+          diagnostic(session.serverName, 'oauth-exchange-failed', diagnosticError(err), 'ERROR')
+          const result = oauthResults.get(stateVal)
+          if (result) { result.status = 'error'; result.error = errMsg }
           res.end(`<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>OAuth Exchange Failed</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#18181b;color:#f4f4f5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}.card{background:#27272a;padding:32px;border-radius:12px;max-width:480px;text-align:center}</style></head>
@@ -697,8 +1051,15 @@ export function apply(ctx: Context): void {
         return
       }
 
+      if (integration && !integration.authorizeRequest(req)) {
+        if (action === 'servers' && sub === 'reconnect') diagnostic(diagnosticServer, 'request-rejected', 'httpStatus=403', 'WARN')
+        json(res, 403, { ok: false, error: 'Request not authorized' })
+        return
+      }
+
       if (!isAuthorized(req)) {
         const denied = authError()
+        if (action === 'servers' && sub === 'reconnect') diagnostic(diagnosticServer, 'request-rejected', `httpStatus=${denied.status}`, 'WARN')
         json(res, denied.status, { ok: false, error: denied.message })
         return
       }
@@ -710,16 +1071,29 @@ export function apply(ctx: Context): void {
 
       if (req.method === 'POST' && action === 'reload') {
         await reloadFromDisk()
-        json(res, 200, { ok: true, servers: state.servers.length })
+        json(res, 200, { ok: true, servers: visibleEntries().length })
         return
       }
 
       // ── OAuth Management Endpoints ──────────────────────────────────────────
+      if (req.method === 'GET' && action === 'oauth' && serverName === 'status') {
+        const result = sub ? oauthResults.get(sub) : undefined
+        if (!result || !available(result.serverName) || Date.now() - result.createdAt > 180_000) {
+          json(res, 404, { ok: false, error: 'OAuth session expired; please authorize again.' })
+          return
+        }
+        json(res, 200, { ok: true, serverName: result.serverName, status: result.status, error: result.error })
+        return
+      }
       if (req.method === 'POST' && action === 'oauth') {
         if (serverName === 'discover') {
           const body = JSON.parse(await readBody(req)) as { url?: string }
           if (!body.url) {
             json(res, 400, { ok: false, error: 'url is required' })
+            return
+          }
+          if (!available('', { serverName: '', transport: 'streamable-http', url: body.url })) {
+            json(res, 400, { ok: false, error: 'server is not available in this product' })
             return
           }
           try {
@@ -744,58 +1118,36 @@ export function apply(ctx: Context): void {
             clientSecret?: string
             scopes?: string[]
             redirectUri?: string
+            openBrowser?: boolean
+          }
+          diagnosticServer = body.serverName
+          if (!available(body.serverName)) {
+            json(res, 404, { ok: false, error: 'server not found' })
+            return
           }
           const entry = findEntry(body.serverName)
           const targetUrl = body.url || entry?.url
+          if (!available(body.serverName, { ...entry, serverName: body.serverName, transport: 'streamable-http', url: targetUrl })) {
+            json(res, 404, { ok: false, error: 'server not found' })
+            return
+          }
           if (!targetUrl) {
             json(res, 400, { ok: false, error: 'url or valid serverName is required' })
             return
           }
 
-          const serverInfo = await discoverOAuthServerInfo(targetUrl).catch(() => ({
-            authorizationServerUrl: targetUrl,
-            authorizationServerMetadata: undefined,
-            resourceMetadata: undefined,
-          }))
-
-          const authServerUrl = serverInfo.authorizationServerUrl || targetUrl
-          const clientId = body.clientId || entry?.oauth?.clientId || 'dsh-mcp-manager'
-          const clientInformation = {
-            client_id: clientId,
-            client_secret: body.clientSecret || entry?.oauth?.clientSecret,
-          }
-
           const hostHeader = (req.headers.host || `127.0.0.1:${ctx.webServer.port}`).split(':')[0]
           const port = ctx.webServer.port
-          const redirectUri = body.redirectUri || `http://${hostHeader}:${port}/mcp-manager/api/oauth/callback`
-          const stateVal = randomBytes(16).toString('hex')
-
-          const { authorizationUrl, codeVerifier } = await startAuthorization(authServerUrl, {
-            metadata: serverInfo.authorizationServerMetadata,
-            clientInformation,
-            redirectUrl: redirectUri,
-            scope: body.scopes?.join(' ') || entry?.oauth?.scopes?.join(' '),
-            state: stateVal,
-          })
-
-          pendingOAuthSessions.set(stateVal, {
-            state: stateVal,
-            serverName: body.serverName,
-            url: targetUrl,
-            codeVerifier,
-            redirectUri,
-            authorizationServerUrl: authServerUrl,
-            metadata: serverInfo.authorizationServerMetadata,
-            clientInformation,
-            createdAt: Date.now(),
-          })
-
-          json(res, 200, {
-            ok: true,
-            authorizationUrl: authorizationUrl.toString(),
-            state: stateVal,
-            redirectUri,
-          })
+          const authorization = await beginOAuth(body, `http://${hostHeader}:${port}/mcp-manager/api/oauth/callback`)
+          const authorizationUrl = new URL(authorization.authorizationUrl)
+          let browserOpened = false
+          if (body.openBrowser && integration?.openAuthorizationUrl && authorizationUrl.protocol === 'https:') {
+            diagnostic(body.serverName, 'oauth-browser-opening')
+            await integration.openAuthorizationUrl(authorizationUrl)
+            browserOpened = true
+          }
+          diagnostic(body.serverName, 'oauth-browser-ready', `browser=${browserOpened ? 'system' : 'popup'}`)
+          json(res, 200, { ...authorization, browserOpened })
           return
         }
 
@@ -819,19 +1171,8 @@ export function apply(ctx: Context): void {
       }
 
       if (req.method === 'GET' && action === 'servers' && serverName === undefined) {
-        const servers = await Promise.all(state.servers.map(entry => decorateEntry(entry)))
-        // Refresh-triggered retry: a manual refresh (or page open) immediately
-        // retries servers whose initial connect failed, throttled so rapid
-        // polling does not hammer the endpoint.
-        for (const entry of state.servers) {
-          const s = statusOf(entry)
-          if (s.status === 'error' && !fibers.has(entry.serverName)) {
-            const last = lastAttempt.get(entry.serverName) ?? 0
-            if (Date.now() - last > RETRY_THROTTLE_MS) {
-              void connect(entry).catch(() => { /* failures are recorded by connectNow */ })
-            }
-          }
-        }
+        const entries = visibleEntries()
+        const servers = await Promise.all(entries.map(entry => decorateEntry(entry)))
         json(res, 200, { ok: true, servers })
         return
       }
@@ -839,6 +1180,7 @@ export function apply(ctx: Context): void {
       if (req.method === 'POST' && action === 'servers' && serverName === undefined) {
         const body = JSON.parse(await readBody(req)) as unknown
         const entry = validateEntry(body)
+        if (entry.oauth) entry.oauth = reconcileOAuthClient(undefined, entry.oauth)
         state.servers.push(entry)
         saveState(path, state)
         void connect(entry).catch(err => {
@@ -848,7 +1190,27 @@ export function apply(ctx: Context): void {
         return
       }
 
+      if (serverName !== undefined && !available(serverName)) {
+        json(res, 404, { ok: false, error: 'server not found' })
+        return
+      }
+
       if (serverName !== undefined) {
+        if (req.method === 'POST' && sub === 'diagnostics') {
+          if (!findEntry(serverName)) { json(res, 404, { ok: false, error: 'server not found' }); return }
+          const body = JSON.parse(await readBody(req)) as { phase?: string; reason?: string }
+          const phases = ['click', 'popup-reserved', 'popup-unavailable', 'request-accepted', 'oauth-required', 'connected', 'failed', 'cancelled']
+          const reasons = ['popup-blocked', 'popup-closed', 'timeout', 'cancelled', 'request-failed']
+          if (!phases.includes(body.phase ?? '') || (body.reason !== undefined && !reasons.includes(body.reason))) {
+            json(res, 400, { ok: false, error: 'invalid diagnostic phase or reason' }); return
+          }
+          const level: DiagnosticLevel = body.phase === 'failed'
+            ? body.reason === 'request-failed' || body.reason === undefined ? 'ERROR' : 'WARN'
+            : body.phase === 'oauth-required' ? 'WARN' : 'INFO'
+          diagnostic(serverName, `ui-${body.phase}`, body.reason ? `reason=${body.reason}` : '', level)
+          json(res, 200, { ok: true })
+          return
+        }
         if (req.method === 'DELETE') {
           await disconnect(serverName)
           const before = state.servers.length
@@ -866,6 +1228,7 @@ export function apply(ctx: Context): void {
           }
           const body = JSON.parse(await readBody(req)) as unknown
           const updated = validateUpdate(serverName, body)
+          if (updated.oauth) updated.oauth = reconcileOAuthClient(entry.oauth, updated.oauth)
           // Assign only the fields the client actually sent, so flags like
           // `enabled` set through the toggle endpoint are preserved.
           for (const [key, value] of Object.entries(updated)) {
@@ -876,7 +1239,7 @@ export function apply(ctx: Context): void {
           // and hot-restarts the mcp-client instance without a full teardown,
           // so the serverName reservation never goes through a race window.
           await enqueue(serverName, async () => {
-            if (entry.enabled === false) {
+            if (!isEnabled(entry)) {
               await disconnectNow(serverName)
               return
             }
@@ -889,7 +1252,7 @@ export function apply(ctx: Context): void {
             connectingSince.set(serverName, Date.now())
             try {
               const resolvedHeaders = await resolveEntryHeaders(entry, () => saveState(path, state))
-              await fiber.update(toMcpConfig(entry, resolvedHeaders))
+              await fiber.update(toMcpConfig(entry, resolvedHeaders, integration))
             } catch (err) {
               const message = err instanceof Error ? err.message : String(err)
               errors.set(serverName, message)
@@ -911,7 +1274,7 @@ export function apply(ctx: Context): void {
           const enabled = body?.enabled === true
           entry.enabled = enabled
           saveState(path, state)
-          if (enabled) {
+          if (isEnabled(entry)) {
             void connect(entry).catch(err => {
               ctx.logger.error(`mcp-manager: enable "${serverName}" connect failed: ${String(err)}`)
             })
@@ -923,6 +1286,7 @@ export function apply(ctx: Context): void {
         }
 
         if (req.method === 'POST' && sub === 'reconnect') {
+          diagnostic(serverName, 'reconnect-requested')
           const entry = findEntry(serverName)
           if (!entry) {
             json(res, 404, { ok: false, error: `server "${serverName}" not found` })
@@ -932,6 +1296,7 @@ export function apply(ctx: Context): void {
           void connect(entry).catch(err => {
             ctx.logger.error(`mcp-manager: reconnect "${serverName}" failed: ${String(err)}`)
           })
+          diagnostic(serverName, 'reconnect-accepted')
           json(res, 200, { ok: true, server: { ...entry, ...statusOf(entry) } })
           return
         }
@@ -950,6 +1315,7 @@ export function apply(ctx: Context): void {
       json(res, 404, { ok: false, error: 'not found' })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
+      if (req.method === 'POST') diagnostic(diagnosticServer, 'request-failed', diagnosticError(err), 'ERROR')
       json(res, 400, { ok: false, error: message })
     }
   }
@@ -965,6 +1331,14 @@ export function apply(ctx: Context): void {
   // The config-file watcher is torn down with the same effect.
   ctx.effect(() => {
     let reloadTimer: ReturnType<typeof setTimeout> | undefined
+    const oauthCleanup = setInterval(() => {
+      for (const [stateId, result] of oauthResults) {
+        if (Date.now() - result.createdAt > 180_000) {
+          oauthResults.delete(stateId)
+          pendingOAuthSessions.delete(stateId)
+        }
+      }
+    }, 30_000)
     const onConfigChange = (): void => {
       if (reloadTimer !== undefined) return
       reloadTimer = setTimeout(() => {
@@ -977,10 +1351,12 @@ export function apply(ctx: Context): void {
     // automatically; the manager's own saveState() writes reconcile as no-ops.
     watchFile(path, { interval: FILE_WATCH_INTERVAL_MS }, onConfigChange)
     return () => {
+      lifetime.abort()
+      clearInterval(oauthCleanup)
+      oauthResults.clear()
+      pendingOAuthSessions.clear()
       if (reloadTimer !== undefined) clearTimeout(reloadTimer)
       unwatchFile(path, onConfigChange)
-      for (const timer of retryTimers.values()) clearTimeout(timer)
-      retryTimers.clear()
       for (const fiber of fibers.values()) {
         void fiber.dispose().catch(() => { /* best-effort teardown */ })
       }
@@ -989,18 +1365,22 @@ export function apply(ctx: Context): void {
       queues.clear()
       connectingSince.clear()
       probeCache.clear()
-      lastAttempt.clear()
+      manualDiagnosticsUntil.clear()
     }
   }, 'mcp-manager.connections')
 
   // Connect every configured server at startup (best-effort; failures log and
   // show as status "error" in the UI, the list stays intact for a retry).
-  for (const entry of state.servers) {
-    void connect(entry).catch(err => {
-      ctx.logger.error(`mcp-manager: startup connect "${entry.serverName}" failed: ${String(err)}`)
-    })
+  const start = (): void => {
+    for (const entry of visibleEntries()) {
+      void connect(entry).catch(err => {
+        ctx.logger.error(`mcp-manager: startup connect "${entry.serverName}" failed: ${String(err)}`)
+      })
+    }
   }
-  ctx.logger.info(`mcp-manager: loaded ${state.servers.length} server(s) from ${path}`)
+  if (integration) ctx.effect(() => integration.onReady(start), 'mcp-manager.ready')
+  else start()
+  ctx.logger.info(`mcp-manager: loaded ${visibleEntries().length} server(s) from ${path}`)
   if (hasToken) {
     ctx.logger.info('mcp-manager: access token configured — /mcp-manager/* requests require "Authorization: Bearer <token>"')
   } else if (exposed) {

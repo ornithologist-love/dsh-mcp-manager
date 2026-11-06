@@ -1,6 +1,8 @@
 # dsh-mcp-manager
 
-[English](README.md) | [中文](README.zh.md) · [![npm version](https://img.shields.io/npm/v/dsh-mcp-manager)](https://www.npmjs.com/package/dsh-mcp-manager) · [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[English](README.md) | [中文](README.zh.md) · [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Source fork of [Nichts0v0/dsh-mcp-manager](https://github.com/Nichts0v0/dsh-mcp-manager), based on `335f797c30b9c3880d997c27343c609c8019f040`, targeting DSH **0.2.2-rc.1**. It adds optional embedding policies, managed connection access and OAuth reconnect improvements. Upstream attribution and the MIT license are retained.
 
 Manage **MCP servers** right from the DeepSeek Harness Web settings page — add, edit, enable/disable, reconnect and delete servers at runtime, with live status, automatic reconnect and config-file hot sync.
 
@@ -10,8 +12,10 @@ Manage **MCP servers** right from the DeepSeek Harness Web settings page — add
 - **OAuth 2.0 / RFC 9728 support** — native MCP OAuth 2.1 authorization with PKCE, automated metadata discovery, browser-based login flow, token auto-refresh and management.
 - **Runtime connections** — servers connect/disconnect on the fly; tools are registered globally as `mcp__<serverName>__<tool>` for every session.
 - **Live status** — reachability probing so a closed server shows **offline** instead of a stale "connected"; a stuck connection times out after 30 s.
-- **Auto-reconnect** — a failed initial connect retries with exponential backoff (3 s → 60 s); pressing refresh retries immediately.
+- **Host-visible diagnostics** — `[MCP][INFO|WARN|ERROR]` stderr records trace reconnect clicks, disconnect/connect, OAuth refresh and browser/callback phases in Debug and Release. Normal progress is INFO, authorization requirements/timeouts/retries are WARN, and failed operations are ERROR; stderr identifies the output channel, not severity. Detailed diagnostics run only during an explicit reconnect and stop when that interaction completes or times out. Polling is quiet. Errors expose known network/HTTP/OAuth codes, never arbitrary response bodies, credentials or authorization URLs; embedding hosts can display these records in their existing runtime log panel.
+- **Explicit retry** — a failed initial connect remains in error until a user reconnects; opening or refreshing the status page never retries a connection.
 - **Enable/disable** — switch a server off to disconnect and unload its tools; switch it on to reconnect.
+- **Embedding activation policy** — `McpManagerIntegration.isEnabled` can override activation for one process while preserving the saved enable flags; connection, reconnect and status use the same policy.
 - **Config file hot sync** — `$DSH_HOME/mcp-servers.json` is watched; external edits take effect within ~1 s, no restart needed.
 - **Themes & i18n** — follows DSH light/dark mode (and `--dsw-alias-*` token overrides from appearance plugins); UI ships in **简体中文 / English**.
 
@@ -23,19 +27,15 @@ Manage **MCP servers** right from the DeepSeek Harness Web settings page — add
 
 ### For humans
 
-**Option 1 — from npm (easiest):**
-
-```sh
-dsh plugin --profile web add dsh-mcp-manager
-```
-
-**Option 2 — from source:**
+**Install this source fork:**
 
 1. Clone and build:
 
    ```sh
-   git clone https://github.com/Nichts0v0/dsh-mcp-manager.git
-   cd dsh-mcp-manager && npm install      # the prepare script builds lib/ automatically
+   git clone https://github.com/ornithologist-love/dsh-mcp-manager.git
+   cd dsh-mcp-manager
+   npm install --ignore-scripts
+   npm run build
    ```
 
 2. Make the package resolvable from the profile (pick one):
@@ -67,8 +67,7 @@ dsh plugin --profile web add dsh-mcp-manager
 Follow every step, in order:
 
 1. **Read this README in full** (especially *Features*, *Known limitations*, and this install section).
-2. **Install the package** (npm is preferred): run `dsh plugin --profile <profile> add dsh-mcp-manager` in the profile you use (or `npm install dsh-mcp-manager` in `$DSH_HOME/profiles/<profile>` and use Option 2 below for the file layout).
-   - **Build/source fallback**: clone this repo, `cd dsh-mcp-manager`, run `npm install --ignore-scripts && npm run build` (produces self-contained `lib/index.js` + `lib/client.js`; zero runtime dependencies), then link the folder into `$DSH_HOME/profiles/<profile>/node_modules/dsh-mcp-manager` (directory junction on Windows, symlink on POSIX).
+2. **Build this fork**: clone this repo, `cd dsh-mcp-manager`, run `npm install --ignore-scripts` and `npm run build`, then link the folder into `$DSH_HOME/profiles/<profile>/node_modules/dsh-mcp-manager` (directory junction on Windows, symlink on POSIX). Use a DSH installation matching the pinned SDK and the declared runtime peers.
 3. **Mount the plugin row**: append to `$DSH_HOME/profiles/<profile>/cordis.patch.yml`:
 
    ```yaml
@@ -182,18 +181,16 @@ The `/mcp-manager/*` API can start `stdio` servers — i.e. execute arbitrary co
 ## Development
 
 ```sh
-npm install      # build-only devDependencies; prepare auto-builds
-npm run build    # esbuild: lib/index.js (host, fully bundled) + lib/client.js (browser)
-npm run watch    # watch the client bundle (works with dsh-client-hmr)
+npm install --ignore-scripts
+npm run build    # lib/index.js (host) + lib/client.js (browser, including CSS)
+npm run watch    # watch both bundles
 ```
 
-**Publishing**: bump `version` in `package.json`, then `npm publish` (the `prepare` script builds `lib/` automatically before packing; the package ships `lib/` + both READMEs + LICENSE).
-
-No runtime dependencies: the host half inlines `@deepseek-ai/dsh-mcp-client`, the MCP SDK and `cross-spawn`; the browser half is a closure-factory bundle served by DSH's client module system.
+The build uses only this repository and public npm dependencies. Runtime peers (`@deepseek-ai/cordis`, `@deepseek-ai/dsh-mcp-client` and `@modelcontextprotocol/sdk`) resolve from the embedding installation. Browser React and DSH modules retain their host identities; CSS Modules are compiled and injected inside the browser factory. `prepack` builds both artifacts before packaging.
 
 ## Known limitations
 
-- **Initial failure retries with backoff, not instantly** — `failOnStartupError` is on, so a failed first connect shows `error` and retries up to every 60 s; once connected, mcp-client's own reconnect handles drops.
+- **Initial failure waits for user action** — `failOnStartupError` is on, so a failed first connect shows `error` without background retries; once connected, mcp-client's own reconnect still handles drops.
 - **Reachability probing is HTTP-level** — a GET with a 2.5 s timeout for `streamable-http` servers (any HTTP response counts as reachable); `stdio` servers are not probed.
 - **Tools only** — MCP Resources/Prompts are not bridged (same as the official mcp-client).
 - **Auth is token-only, loopback-by-default** — `/mcp-manager/*` has no built-in user accounts; use the optional `token` (see *Security*) before exposing `--host 0.0.0.0` (stdio servers execute arbitrary commands).
@@ -202,3 +199,13 @@ No runtime dependencies: the host half inlines `@deepseek-ai/dsh-mcp-client`, th
 ## License
 
 MIT
+
+## Embedding this source fork
+
+An embedding provider may supply `isAvailable(entry)` to hide and refuse host-reserved servers by name or endpoint before connection, management, probing or OAuth. Hidden entries stay intact on disk. New or updated entries must also satisfy this policy; omitting it preserves standalone behavior.
+
+Set `useIntegration: true` to wait for a `mcpManagerIntegration` provider. The provider transforms connection inputs, authorizes non-callback requests, prepares OAuth client registration, and schedules startup connections after readiness. Unloading it releases the manager scope. Without this option the manager uses its original standalone startup and access checks. The OAuth callback retains pending-state validation; authorization, code exchange and refresh carry the discovered resource, and refresh uses server metadata and reports failure instead of reusing an expired token. Reconnect reserves a popup during the click and polls the manager after authorization; completion messages require the same origin.
+
+The embedding provider can also supply `products: { active: "alpha", servers: { alpha: ["alpha-tools"], beta: ["beta-tools"] } }`. The manager lists, connects, retries, probes and manages only servers owned by the active product, plus servers absent from all groups. Omitting `active` hides all product-owned entries. Hidden entries reject direct management and OAuth requests; they remain intact on disk with their enabled flags and credentials when another entry is saved. This also applies to existing global configurations without a data migration. Product selection belongs to the embedding provider, not a user-editable server field.
+
+The same-process `ctx.mcpManager` service offers `servers()`, `tools(serverName)` and `callTool(serverName, execution)` for enhancement plugins, without exposing credentials or transport handles. `ensureConnected(serverName, {interactive, signal, onPhase})` allows enabling, connecting and authorization only for explicit user interaction (`interactive: true`), using the embedding provider's `openAuthorizationUrl(URL)` system-browser opener. It reuses the manager's PKCE flow, callback and token store; concurrent requests for the same server share authorization. Restoring a session never opens a browser, and cancelling one waiter does not close another session's shared connection. Calls require an already connected, product-visible server and dispatch through the native ToolRuntime with the caller scope, policy pipeline and cancellation. Nested callers propagate their parent token and root call ID. Raw MCP registrations remain manager-owned.

@@ -8,6 +8,11 @@
  */
 
 export type LocaleKey =
+  | 'oauthPopupBlocked'
+  | 'oauthHttpsRequired'
+  | 'oauthPopupClosed'
+  | 'oauthStillWaiting'
+
   | 'nav'
   | 'title'
   | 'intro'
@@ -33,6 +38,7 @@ export type LocaleKey =
   | 'editTitle'
   | 'backToList'
   | 'deleteServer'
+  | 'deleteTitle'
   | 'confirmDelete'
   | 'deleting'
   | 'deleteHint'
@@ -78,12 +84,17 @@ export type LocaleKey =
 
 /** Placeholders in template strings: `{n}`, `{name}` are replaced at render time. */
 export const zh: Record<LocaleKey, string> = {
+  oauthPopupBlocked: '授权窗口未打开，请允许弹出窗口后再次点击重连',
+  oauthHttpsRequired: 'OAuth 授权地址必须使用 HTTPS',
+  oauthPopupClosed: '授权窗口已关闭，尚未连接；可再次点击重连',
+  oauthStillWaiting: '仍在等待 OAuth 授权，请完成已打开的登录页面后刷新状态',
+
   nav: 'MCP 服务器',
   title: 'MCP 服务器管理',
   intro: '在此管理 MCP 服务器：启用/停用、编辑、删除。配置保存在 $DSH_HOME/mcp-servers.json，对所有会话生效；连接成功后工具以 mcp__<serverName>__<tool> 提供给 agent。',
   configured: '已配置的服务器',
   loading: '加载中…',
-  empty: '（还没有配置任何服务器）',
+  empty: '还没有配置任何服务器',
   connected: '已连接 ({n} 工具)',
   connecting: '连接中…',
   error: '连接错误',
@@ -97,15 +108,16 @@ export const zh: Record<LocaleKey, string> = {
   edit: '编辑',
   enabledLabel: '已启用',
   disabledLabel: '已停用',
-  addServer: '＋ 添加 MCP 服务器',
+  addServer: '添加 MCP 服务器',
   refresh: '刷新状态',
   addTitle: '添加 MCP 服务器',
   editTitle: '编辑服务器 {name}',
-  backToList: '← 返回列表',
+  backToList: '返回列表',
   deleteServer: '删除服务器',
-  confirmDelete: '确认删除？',
+  deleteTitle: '删除服务器 {name}？',
+  confirmDelete: '删除',
   deleting: '删除中…',
-  deleteHint: '删除后将永久移除该服务器并立即卸载其工具，此操作不可恢复。3 秒内未点「确认删除？」将自动取消。',
+  deleteHint: '将从 mcp-servers.json 永久移除该服务器并立即卸载其工具，此操作不可恢复。',
   fieldServerName: 'serverName',
   fieldTransport: '传输方式',
   fieldUrl: 'URL',
@@ -148,12 +160,17 @@ export const zh: Record<LocaleKey, string> = {
 }
 
 export const en: Record<LocaleKey, string> = {
+  oauthPopupBlocked: 'Allow popups and click Reconnect again to authorize.',
+  oauthHttpsRequired: 'The OAuth authorization URL must use HTTPS.',
+  oauthPopupClosed: 'The authorization window closed before connection; click Reconnect to try again.',
+  oauthStillWaiting: 'Complete authorization in the open window, then refresh the status.',
+
   nav: 'MCP Manager',
   title: 'MCP Server Manager',
   intro: 'Manage MCP servers: enable/disable, edit, delete. Config lives in $DSH_HOME/mcp-servers.json and is shared by all sessions; on connect, tools are exposed to agents as mcp__<serverName>__<tool>.',
   configured: 'Configured Servers',
   loading: 'Loading…',
-  empty: '(No servers configured yet)',
+  empty: 'No servers configured yet',
   connected: 'Connected ({n} tools)',
   connecting: 'Connecting…',
   error: 'Connection error',
@@ -167,15 +184,16 @@ export const en: Record<LocaleKey, string> = {
   edit: 'Edit',
   enabledLabel: 'Enabled',
   disabledLabel: 'Disabled',
-  addServer: '＋ Add MCP Server',
+  addServer: 'Add MCP Server',
   refresh: 'Refresh',
   addTitle: 'Add MCP Server',
   editTitle: 'Edit Server {name}',
-  backToList: '← Back to list',
+  backToList: 'Back to list',
   deleteServer: 'Delete Server',
-  confirmDelete: 'Confirm delete?',
+  deleteTitle: 'Delete server {name}?',
+  confirmDelete: 'Delete',
   deleting: 'Deleting…',
-  deleteHint: 'This permanently removes the server and immediately unloads its tools. Confirm within 3 seconds or the action is cancelled.',
+  deleteHint: 'This permanently removes the server from mcp-servers.json and immediately unloads its tools.',
   fieldServerName: 'serverName',
   fieldTransport: 'Transport',
   fieldUrl: 'URL',

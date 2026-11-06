@@ -1,116 +1,85 @@
-/**
- * Build script for dsh-mcp-manager.
- *
- * Two artifacts, mirroring the harness's own client-bundle conventions:
- *  - lib/index.js  — host half: ESM, fully bundled (mcp-client + SDK inlined),
- *                    no runtime dependencies to resolve from the profile.
- *  - lib/client.js — browser half: a CJS closure-factory bundle that calls
- *                    window.__ModuleLoader__.load({ id, factory }), with the
- *                    platform seed modules left external so the browser module
- *                    table answers them at runtime.
- *
- * Usage: node scripts/build.mjs [--watch]
- */
-
+/** Build the host module and DSH browser closure factory using public dependencies. */
 import { build, context } from 'esbuild'
-import { readFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import { relative } from 'node:path'
+import { transform } from 'lightningcss'
 
-/** package.json is the single source of truth for the plugin version. */
-const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8').replace(/^\uFEFF/, ''))
-const PLUGIN_VERSION = pkg.version
+const root = fileURLToPath(new URL('../', import.meta.url))
+const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
+const mode = process.env.NODE_ENV ?? 'production'
+const minify = mode === 'production'
 
-/** The browser module table's seed specifiers (mirror of the harness list). */
-const PLATFORM_MODULES = [
-  'react',
-  'react/jsx-runtime',
-  'react-dom',
-  'react-dom/client',
-  '@deepseek-ai/cordis',
-  '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-web-react',
-  '@deepseek-ai/dsh-client-ui-primitives',
-  '@deepseek-ai/dsh-client-ui-attachment',
-  '@deepseek-ai/dsh-client-schema-form',
-]
-
-const NODE_ENV = process.env.NODE_ENV ?? 'production'
-
-/** Minify production builds (the plugin ships its own bundles; size matters for installs). */
-const MINIFY = NODE_ENV === 'production'
-
-async function buildOnce() {
-  // ── host half ───────────────────────────────────────────────────────────────
-  await build({
-    entryPoints: ['src/index.ts'],
-    outfile: 'lib/index.js',
-    bundle: true,
-    format: 'esm',
-    platform: 'node',
-    target: 'node20',
-    sourcemap: true,
-    minify: MINIFY,
-    logLevel: 'info',
-    define: { __DSH_MCP_MANAGER_VERSION__: JSON.stringify(PLUGIN_VERSION) },
-    // Bundled CJS dependencies (e.g. cross-spawn inside the MCP SDK) call
-    // require('child_process') etc. at runtime. In ESM scope `require` does
-    // not exist, so esbuild's __require fallback would throw "Dynamic require
-    // ... is not supported" under the harness loader. Provide a real require
-    // through createRequire before the bundle body runs.
-    banner: { js: "import { createRequire as __dshCreateRequire } from 'node:module';\nconst require = __dshCreateRequire(import.meta.url);" },
-  })
-
-  // ── browser half ────────────────────────────────────────────────────────────
-  await build({
-    entryPoints: ['src/client/index.tsx'],
-    outfile: 'lib/client.js',
-    bundle: true,
-    format: 'cjs',
-    platform: 'browser',
-    target: 'es2020',
-    sourcemap: true,
-    minify: MINIFY,
-    logLevel: 'info',
-    jsx: 'automatic',
-    external: PLATFORM_MODULES,
-    define: {
-      'process.env.NODE_ENV': JSON.stringify(NODE_ENV),
-      'import.meta.env.MODE': JSON.stringify(NODE_ENV),
-      'import.meta.env': JSON.stringify({ MODE: NODE_ENV }),
-    },
-    // esbuild has no `intro` option (that is rolldown's); the closure-factory
-    // wrapper is expressed as banner + footer, with `module`/`exports` defined
-    // first exactly like the harness's tsdown client preset does.
-    banner: { js: 'var module = { exports: {} }; var exports = module.exports;\nwindow.__ModuleLoader__.load({ id: "dsh-mcp-manager", factory: (require) => {' },
-    footer: { js: 'return module.exports; } });' },
-  })
-
-  console.log('[dsh-mcp-manager] build complete: lib/index.js + lib/client.js')
+// DSH owns these module identities; both artifacts resolve them from their host.
+const external = ['@deepseek-ai/*', '@modelcontextprotocol/sdk', '@modelcontextprotocol/sdk/*']
+const shared = {
+  absWorkingDir: root,
+  bundle: true,
+  target: 'es2024',
+  sourcemap: true,
+  minify,
+  logLevel: 'info',
 }
 
-const watch = process.argv.includes('--watch')
+const cssModules = {
+  name: 'dsh-mcp-manager-css',
+  setup(builder) {
+    builder.onLoad({ filter: /\.module\.css$/ }, async args => {
+      const result = transform({
+        filename: relative(root, args.path).replaceAll('\\', '/'),
+        code: await readFile(args.path),
+        cssModules: true,
+        minify,
+      })
+      const classes = Object.fromEntries(Object.entries(result.exports).map(([key, value]) => [key, value.name]))
+      return {
+        loader: 'js',
+        watchFiles: [args.path],
+        contents: `
+          let style = document.querySelector('style[data-dsh-mcp-manager]');
+          if (!style) {
+            style = document.createElement('style');
+            style.dataset.dshMcpManager = '';
+            document.head.appendChild(style);
+          }
+          style.textContent = ${JSON.stringify(result.code.toString())};
+          export default ${JSON.stringify(classes)};
+        `,
+      }
+    })
+  },
+}
 
-if (watch) {
-  const client = await context({
-    entryPoints: ['src/client/index.tsx'],
-    outfile: 'lib/client.js',
-    bundle: true,
-    format: 'cjs',
-    platform: 'browser',
-    target: 'es2020',
-    sourcemap: true,
-    logLevel: 'info',
-    jsx: 'automatic',
-    external: PLATFORM_MODULES,
-    define: {
-      'process.env.NODE_ENV': JSON.stringify(NODE_ENV),
-      'import.meta.env.MODE': JSON.stringify(NODE_ENV),
-      'import.meta.env': JSON.stringify({ MODE: NODE_ENV }),
-    },
-    banner: { js: 'var module = { exports: {} }; var exports = module.exports;\nwindow.__ModuleLoader__.load({ id: "dsh-mcp-manager", factory: (require) => {' },
-    footer: { js: 'return module.exports; } });' },
-  })
-  await client.watch()
-  console.log('[dsh-mcp-manager] watching client bundle...')
+const host = {
+  ...shared,
+  entryPoints: ['src/index.ts'],
+  outfile: 'lib/index.js',
+  format: 'esm',
+  platform: 'node',
+  external,
+  define: { __DSH_MCP_MANAGER_VERSION__: JSON.stringify(pkg.version) },
+}
+const client = {
+  ...shared,
+  entryPoints: ['src/client/index.tsx'],
+  outfile: 'lib/client.js',
+  format: 'cjs',
+  platform: 'browser',
+  jsx: 'automatic',
+  external: [...external, 'react', 'react/*', 'react-dom', 'react-dom/*'],
+  plugins: [cssModules],
+  define: {
+    'process.env.NODE_ENV': JSON.stringify(mode),
+    'import.meta.env.MODE': JSON.stringify(mode),
+    'import.meta.env': JSON.stringify({ MODE: mode }),
+  },
+  banner: { js: 'window.__ModuleLoader__.load({ id: "dsh-mcp-manager", factory: (require) => {\nvar module = { exports: {} }; var exports = module.exports;' },
+  footer: { js: 'return module.exports; } });' },
+}
+
+if (process.argv.includes('--watch')) {
+  const contexts = await Promise.all([context(host), context(client)])
+  await Promise.all(contexts.map(value => value.watch()))
 } else {
-  await buildOnce()
+  await Promise.all([build(host), build(client)])
 }
