@@ -35,6 +35,7 @@ export async function authorizeOAuth(
       method: 'POST', headers: { 'Content-Type': 'application/json' }, signal,
       body: JSON.stringify({ ...body, openBrowser: true }),
     })
+    report(request, api, body.serverName, 'oauth-start-received', result.browserOpened ? 'host-browser' : 'popup-browser')
     if (result.browserOpened) {
       popup?.close()
       popup = null
@@ -49,6 +50,7 @@ export async function authorizeOAuth(
         if (!popup && !loopback) throw new Error(t('oauthPopupBlocked'))
       }
     }
+    report(request, api, body.serverName, 'oauth-poll-start')
     const deadline = Date.now() + 120000
     while (Date.now() < deadline) {
       signal?.throwIfAborted()
@@ -56,6 +58,7 @@ export async function authorizeOAuth(
         `${api}/oauth/status/${encodeURIComponent(result.state)}`, { signal },
       )
       if (status.status === 'authorized') {
+        report(request, api, body.serverName, 'oauth-authorized')
         const connectionDeadline = Date.now() + 35000
         while (Date.now() < connectionDeadline) {
           signal?.throwIfAborted()

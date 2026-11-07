@@ -49,7 +49,7 @@ export interface McpManagerIntegration {
    * fresh client and report it with `registered: true`.
    */
   prepareOAuthClient(client: { client_id: string; client_secret?: string }, discovery: Awaited<ReturnType<typeof discoverOAuthServerInfo>>, redirectUri: string, configured: boolean): Promise<void | { registered: boolean }>
-  /** Open an SDK-generated authorization URL in the embedding product's system browser. */
+  /** Ask the embedding product to open an SDK-generated authorization URL. */
   openAuthorizationUrl?(url: URL): Promise<void>
   onReady(start: () => void): () => void
 }
@@ -330,7 +330,7 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
   function diagnosticError(error: unknown): string {
     const cause = (error as { cause?: unknown } | null)?.cause
     const text = `${String(error)} ${String(cause ?? '')}`
-    const type = error instanceof TypeError ? 'TypeError' : error instanceof Error ? 'Error' : 'UnknownError'
+    const type = error instanceof Error && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(error.name) ? error.name : 'UnknownError'
     const code = text.match(/\b(?:ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EPIPE|CERT_HAS_EXPIRED|DEPTH_ZERO_SELF_SIGNED_CERT|UNABLE_TO_VERIFY_LEAF_SIGNATURE|UND_ERR_CONNECT_TIMEOUT)\b/)?.[0]
     const oauth = text.match(/\b(?:invalid_grant|invalid_token|invalid_client|unauthorized_client|access_denied|invalid_scope|server_error|temporarily_unavailable)\b/i)?.[0].toLowerCase()
     const status = text.match(/(?:\bHTTP|\bstatus(?:\s+code)?|\bSSE error)[^\d\r\n]{0,32}([45]\d\d)\b/i)?.[1]
@@ -339,6 +339,23 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
       : /OAuth|unauthorized|授权|\b401\b/i.test(text) ? 'authorization'
       : /fetch failed|network|socket|connect/i.test(text) ? 'transport' : 'operation'
     return `errorType=${type} reason=${reason}${code ? ` code=${code}` : ''}${status ? ` httpStatus=${status}` : ''}${oauth ? ` oauthError=${oauth}` : ''}`
+  }
+
+  // SDK-supported fetch injection records transport metadata without reading bodies,
+  // headers, authorization URLs or credentials, and returns the original response.
+  function diagnosticFetch(serverName: string, phase: string): typeof fetch {
+    return async (input, init) => {
+      const started = Date.now()
+      try {
+        const response = await fetch(input, init)
+        diagnostic(serverName, phase, `httpStatus=${response.status} redirected=${response.redirected} elapsedMs=${Date.now() - started}`,
+          response.ok ? 'INFO' : 'WARN')
+        return response
+      } catch (error) {
+        diagnostic(serverName, phase, `elapsedMs=${Date.now() - started} ${diagnosticError(error)}`, 'ERROR')
+        throw error
+      }
+    }
   }
 
   /** Whether the web server is reachable beyond loopback (needs an access token). */
@@ -404,7 +421,7 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
   // The system browser has no WebView opener. Keep a short-lived result for
   // the initiating settings page to observe without exposing any credentials.
   const oauthResults = new Map<string, {
-    serverName: string; status: 'pending' | 'authorized' | 'error'; error?: string; createdAt: number
+    serverName: string; status: 'pending' | 'authorized' | 'error'; error?: string; createdAt: number; lastDiagnosticAt?: number
   }>()
   const authorizationJobs = new Map<string, Promise<void>>()
   const lifetime = new AbortController()
@@ -478,10 +495,14 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
       if (tokens.refreshToken && tokens.expiresAt && Date.now() > tokens.expiresAt - 60_000) {
         const started = Date.now()
         diagnostic(entry.serverName, 'oauth-refresh-start')
+        let stage = 'discovery'
         try {
           const authServerUrl = entry.oauth.authorizationServerUrl || entry.url || ''
           if (authServerUrl) {
-            const discovered = await discoverOAuthServerInfo(entry.url || authServerUrl)
+            const discovered = await discoverOAuthServerInfo(entry.url || authServerUrl,
+              { fetchFn: diagnosticFetch(entry.serverName, 'oauth-discovery-http') })
+            diagnostic(entry.serverName, 'oauth-discovery-complete', `metadata=${Boolean(discovered.authorizationServerMetadata)}`)
+            stage = 'token-refresh'
             const refreshed = await refreshAuthorization(authServerUrl, {
               metadata: discovered.authorizationServerMetadata,
               clientInformation: {
@@ -490,6 +511,7 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
               },
               refreshToken: tokens.refreshToken,
               resource: entry.url ? new URL(discovered.resourceMetadata?.resource || entry.url) : undefined,
+              fetchFn: diagnosticFetch(entry.serverName, 'oauth-refresh-http'),
             })
             if (refreshed.access_token) {
               tokens.accessToken = refreshed.access_token
@@ -500,7 +522,7 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
             }
           }
         } catch (err) {
-          diagnostic(entry.serverName, 'oauth-refresh-failed', `elapsedMs=${Date.now() - started} ${diagnosticError(err)}`, 'ERROR')
+          diagnostic(entry.serverName, 'oauth-refresh-failed', `stage=${stage} elapsedMs=${Date.now() - started} ${diagnosticError(err)}`, 'ERROR')
           ctx.logger.warn(`mcp-manager: token refresh failed for "${entry.serverName}": ${String(err)}`)
           throw new Error(`服务器「${entry.serverName}」的 OAuth 授权刷新失败，请重新授权后连接。`)
         }
@@ -966,6 +988,7 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
             codeVerifier: session.codeVerifier,
             redirectUri: session.redirectUri,
             resource: new URL(session.resource),
+            fetchFn: diagnosticFetch(session.serverName, 'oauth-exchange-http'),
           })
 
           let entry = findEntry(session.serverName)
@@ -1079,8 +1102,13 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
       if (req.method === 'GET' && action === 'oauth' && serverName === 'status') {
         const result = sub ? oauthResults.get(sub) : undefined
         if (!result || !available(result.serverName) || Date.now() - result.createdAt > 180_000) {
+          if (result) diagnostic(result.serverName, 'oauth-status-expired', `ageMs=${Date.now() - result.createdAt}`, 'WARN')
           json(res, 404, { ok: false, error: 'OAuth session expired; please authorize again.' })
           return
+        }
+        if (!result.lastDiagnosticAt || Date.now() - result.lastDiagnosticAt >= 15_000 || result.status !== 'pending') {
+          diagnostic(result.serverName, 'oauth-status-polled', `status=${result.status} ageMs=${Date.now() - result.createdAt}`)
+          result.lastDiagnosticAt = Date.now()
         }
         json(res, 200, { ok: true, serverName: result.serverName, status: result.status, error: result.error })
         return
@@ -1146,7 +1174,7 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
             await integration.openAuthorizationUrl(authorizationUrl)
             browserOpened = true
           }
-          diagnostic(body.serverName, 'oauth-browser-ready', `browser=${browserOpened ? 'system' : 'popup'}`)
+          diagnostic(body.serverName, 'oauth-browser-ready', `browser=${browserOpened ? 'host' : 'popup'} callbackReceived=false`)
           json(res, 200, { ...authorization, browserOpened })
           return
         }
@@ -1199,8 +1227,9 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
         if (req.method === 'POST' && sub === 'diagnostics') {
           if (!findEntry(serverName)) { json(res, 404, { ok: false, error: 'server not found' }); return }
           const body = JSON.parse(await readBody(req)) as { phase?: string; reason?: string }
-          const phases = ['click', 'popup-reserved', 'popup-unavailable', 'request-accepted', 'oauth-required', 'connected', 'failed', 'cancelled']
-          const reasons = ['popup-blocked', 'popup-closed', 'timeout', 'cancelled', 'request-failed']
+          const phases = ['click', 'popup-reserved', 'popup-unavailable', 'request-accepted', 'oauth-required',
+            'oauth-start-received', 'oauth-poll-start', 'oauth-authorized', 'connected', 'failed', 'cancelled']
+          const reasons = ['popup-blocked', 'popup-closed', 'timeout', 'cancelled', 'request-failed', 'system-browser', 'host-browser', 'popup-browser']
           if (!phases.includes(body.phase ?? '') || (body.reason !== undefined && !reasons.includes(body.reason))) {
             json(res, 400, { ok: false, error: 'invalid diagnostic phase or reason' }); return
           }
