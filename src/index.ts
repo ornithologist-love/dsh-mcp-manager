@@ -30,6 +30,8 @@ import type { Context, Fiber } from '@deepseek-ai/cordis'
 
 /** Optional embedding policy; the manager keeps ownership of routes and connections. */
 export interface McpManagerIntegration {
+  /** Notify when embedding contributions or availability policy change. */
+  subscribe?(listener: () => void): () => void
   /** Hide and refuse host-reserved entries without changing their persisted configuration. */
   isAvailable?(entry: McpServerEntry): boolean
   /** Override activation for this process without changing the saved enable flag. */
@@ -1360,6 +1362,14 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
   // The config-file watcher is torn down with the same effect.
   ctx.effect(() => {
     let reloadTimer: ReturnType<typeof setTimeout> | undefined
+    const unsubscribe = integration?.subscribe?.(() => {
+      void reloadFromDisk().then(async () => {
+        for (const entry of state.servers) {
+          if (!available(entry.serverName, entry) || !isEnabled(entry)) await disconnect(entry.serverName)
+          else if (!fibers.has(entry.serverName)) void connect(entry).catch(err => ctx.logger.warn('mcp-manager: contribution connect failed: %s', String(err)))
+        }
+      }).catch(err => ctx.logger.warn('mcp-manager: contribution refresh failed: %s', String(err)))
+    })
     const oauthCleanup = setInterval(() => {
       for (const [stateId, result] of oauthResults) {
         if (Date.now() - result.createdAt > 180_000) {
@@ -1380,6 +1390,7 @@ function applyManager(ctx: Context, integration?: McpManagerIntegration): void {
     // automatically; the manager's own saveState() writes reconcile as no-ops.
     watchFile(path, { interval: FILE_WATCH_INTERVAL_MS }, onConfigChange)
     return () => {
+      unsubscribe?.()
       lifetime.abort()
       clearInterval(oauthCleanup)
       oauthResults.clear()
